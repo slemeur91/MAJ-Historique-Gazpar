@@ -9,8 +9,8 @@
 #  Sources fusionnées (priorité décroissante) :
 #    daily > weekly > monthly > yearly
 #
-#  Trois statistiques sont écrites, une ligne par heure, du premier jour de
-#  données jusqu'à la dernière heure terminée :
+#  Trois statistiques sont écrites, une ligne par heure, jusqu'à la dernière
+#  heure terminée :
 #    - TARGET_M3_ID   (m³)  : index du compteur
 #    - TARGET_KWH_ID  (kWh) : énergie cumulée (energy_kwh GRDF)
 #    - TARGET_COST_ID (EUR) : coût cumulé (kWh × prix), statistique externe
@@ -19,12 +19,19 @@
 #  23:00 ; les jours sans relevé (et aujourd'hui) gardent la dernière valeur
 #  connue → conso 0 en attendant la publication GRDF (J-2 / J-3).
 #
-#  m³ et kWh sont aussi compilés nativement par HA à partir des capteurs en
-#  direct. Pour que HA reparte sans écart après le script :
-#    - les valeurs sont ancrées sur l'état actuel du capteur en direct
-#      (la dernière ligne écrite a state = état du capteur) ;
-#    - sum = state + décalage, où le décalage est celui de la dernière ligne
-#      déjà enregistrée (sum − state), propre à chaque statistique.
+#  Continuité :
+#    - en mise à jour, chaque statistique repart du cumul déjà enregistré
+#      juste avant la fenêtre (aucun saut au début de la fenêtre, même si
+#      GRDF corrige après coup un jour déjà publié) ;
+#    - m³ et kWh sont aussi compilés nativement par HA à partir des capteurs
+#      en direct : après l'écriture, le cumul natif de HA (statistiques
+#      5 minutes) est recalé sur la dernière heure écrite, pour que HA
+#      reparte sans écart.
+#
+#  ATTENTION : depuis gazpar2mqtt 0.3.x, le capteur source ne garde que
+#  14 jours de relevés journaliers. gazpar_import_all réécrit tout
+#  l'historique avec ce qui reste (semaines / mois) et perd le détail
+#  journalier plus ancien : ne le lancer qu'en cas de reprise complète.
 # ════════════════════════════════════════════════════════════════════════════
 
 import calendar
@@ -53,7 +60,8 @@ COST_START_DATE = "2026-10-16"   # 1er jour valorisé (AAAA-MM-JJ) ; None = tout
 
 DEFAULT_FACTOR = 11.2   # kWh/m³ si le relevé n'a pas de coefficient de conversion
 UPDATE_DAYS    = 7      # nb de jours relus lors d'un update incrémental
-LOOKBACK_ROWS  = 400    # lignes horaires relues pour retrouver l'ancre du coût
+LOOKBACK_ROWS  = 400    # lignes horaires relues pour retrouver l'ancre avant la fenêtre
+SYNC_EPSILON   = 0.001  # écart minimal déclenchant le recalage du cumul natif de HA
 # ─────────────────────────────────────────────────
 
 FRENCH_MONTHS = {
@@ -214,7 +222,8 @@ def _build_timeline(entries):
       - jour avec relevé : valeur de la veille de 00:00 à 22:00,
         valeur du jour à 23:00 ;
       - jours sans relevé (et aujourd'hui) : dernière valeur connue.
-    `kwh` est un cumul relatif (0 au début de l'historique).
+    `kwh` est un cumul relatif (0 au début de l'historique) : seules ses
+    différences sont utilisées.
     """
     import homeassistant.util.dt as dt_util
 
@@ -302,7 +311,7 @@ def _to_utc_dt(value):
 
 
 async def _get_recent_stats(statistic_id, number):
-    """Derniers points enregistrés {start, state, sum}, du plus ancien au plus récent."""
+    """Derniers points horaires {start, state, sum}, du plus ancien au plus récent."""
     from homeassistant.components.recorder.statistics import get_last_statistics
 
     if inspect.iscoroutinefunction(get_last_statistics):
@@ -323,6 +332,22 @@ async def _get_recent_stats(statistic_id, number):
     return parsed
 
 
+async def _get_latest_short_term(statistic_id, since_utc):
+    """Dernier point 5 minutes {start, state, sum} depuis since_utc, ou None."""
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    result = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, since_utc, None, {statistic_id},
+        "5minute", None, {"sum", "state"}
+    )
+    rows = result.get(statistic_id) or []
+    if not rows:
+        return None
+    last = rows[-1]
+    return {"start": _to_utc_dt(last["start"]), "state": last.get("state"), "sum": last.get("sum")}
+
+
 def _live_value(entity_id):
     entity = hass.states.get(entity_id)
     if entity is None:
@@ -339,14 +364,33 @@ def _first_index_since(timeline, since):
     return len(timeline)
 
 
+async def _find_anchor(statistic_id, timeline, start_i):
+    """Cumul enregistré à l'heure qui précède timeline[start_i], ou None."""
+    if start_i <= 0:
+        return None
+    prev_ts = timeline[start_i - 1]["start"].timestamp()
+    rows = await _get_recent_stats(statistic_id, LOOKBACK_ROWS)
+    for r in rows:
+        if r["start"] is not None and r["sum"] is not None and r["start"].timestamp() == prev_ts:
+            return r["sum"]
+    return None
+
+
 # ── Écriture des statistiques ─────────────────────────────────────────────────
 
 async def _write_native(statistic_id, name, unit, unit_class, timeline, key, since, label):
     """
-    Statistique également compilée par HA (m³, kWh). Les valeurs sont ancrées
-    sur l'état actuel du capteur : la dernière ligne a state = état du capteur,
-    et sum garde le décalage (sum − state) de la dernière ligne enregistrée.
+    Statistique également compilée par HA (m³, kWh).
+      1. sum repart du cumul enregistré juste avant la fenêtre (continuité,
+         y compris si GRDF a corrigé après coup un jour déjà publié) ;
+         en import complet, sum part de 0 au premier jour ;
+      2. state = état actuel du capteur moins la conso restant à venir
+         (affichage d'un index cohérent avec le capteur) ;
+      3. le cumul natif de HA (5 minutes) est recalé sur la dernière heure
+         écrite, pour que les heures suivantes compilées par HA repartent
+         sans écart.
     """
+    from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.statistics import async_import_statistics
 
     live = _live_value(statistic_id)
@@ -354,27 +398,61 @@ async def _write_native(statistic_id, name, unit, unit_class, timeline, key, sin
         log.warning("GAZPAR %s – %s indisponible, statistique non réécrite", label, statistic_id)
         return 0
 
-    last_rows = await _get_recent_stats(statistic_id, 1)
-    offset = 0.0
-    if last_rows and last_rows[-1]["sum"] is not None and last_rows[-1]["state"] is not None:
-        offset = last_rows[-1]["sum"] - last_rows[-1]["state"]
+    start_i = _first_index_since(timeline, since)
+    if start_i >= len(timeline):
+        return 0
+
+    if since is None:
+        anchor_sum = 0.0
+        ref        = timeline[0][key]
+    else:
+        anchor_sum = await _find_anchor(statistic_id, timeline, start_i)
+        if anchor_sum is None:
+            log.warning(
+                "GAZPAR %s – %s : aucune ligne enregistrée avant %s, statistique non "
+                "réécrite (lancer gazpar_import_all si c'est une première installation)",
+                label, statistic_id, timeline[start_i]["start"].isoformat(),
+            )
+            return 0
+        ref = timeline[start_i - 1][key]
 
     final = timeline[-1][key]
     stats = []
-    for p in timeline[_first_index_since(timeline, since):]:
-        value = round(live - (final - p[key]), 3)
-        stats.append({"start": p["start"], "state": value, "sum": round(value + offset, 3)})
+    for p in timeline[start_i:]:
+        stats.append({
+            "start": p["start"],
+            "state": round(live - (final - p[key]), 3),
+            "sum":   round(anchor_sum + (p[key] - ref), 3),
+        })
 
-    if not stats:
-        return 0
+    # ── Recalage du cumul natif de HA sur la dernière heure écrite ──────────
+    # L'écart est mesuré avant l'écriture. HA applique un ajustement aux
+    # lignes 5 minutes à partir de sync_from, mais aux lignes horaires à partir
+    # du début de l'heure : la dernière ligne horaire écrite sera donc elle
+    # aussi décalée, on l'écrit d'avance avec l'écart retiré.
+    last      = stats[-1]
+    target    = last["sum"]
+    sync_from = last["start"] + timedelta(minutes=55)   # dernier 5 min de l'heure écrite
+    short     = await _get_latest_short_term(statistic_id, last["start"])
+    shift     = 0.0
+    if short is not None and short["sum"] is not None and short["state"] is not None:
+        expected = target + (short["state"] - last["state"])
+        shift    = round(expected - short["sum"], 3)
+        if abs(shift) > SYNC_EPSILON:
+            last["sum"] = round(target - shift, 3)
+        else:
+            shift = 0.0
 
     metadata = _build_metadata(statistic_id, "recorder", name, unit, unit_class)
     await async_import_statistics(hass, metadata, stats)
+    if shift:
+        get_instance(hass).async_adjust_statistics(statistic_id, sync_from, shift, unit)
+
     log.info(
-        "GAZPAR %s – %s : %d ligne(s) [%s → %s], dernière valeur %.3f %s (décalage sum %.3f)",
+        "GAZPAR %s – %s : %d ligne(s) [%s → %s], cumul %.3f %s, recalage HA %+.3f",
         label, statistic_id, len(stats),
-        stats[0]["start"].isoformat(), stats[-1]["start"].isoformat(),
-        stats[-1]["state"], unit, offset,
+        stats[0]["start"].isoformat(), last["start"].isoformat(),
+        target, unit, shift,
     )
     return len(stats)
 
@@ -402,12 +480,9 @@ async def _write_cost(timeline, since, label):
     ref_kwh = 0.0
 
     if start_i > cost_start_i:
-        prev = timeline[start_i - 1]
-        rows = await _get_recent_stats(TARGET_COST_ID, LOOKBACK_ROWS)
-        for r in rows:
-            if r["start"] is not None and r["start"].timestamp() == prev["start"].timestamp():
-                anchor  = r["sum"]
-                ref_kwh = prev["kwh"]
+        anchor = await _find_anchor(TARGET_COST_ID, timeline, start_i)
+        if anchor is not None:
+            ref_kwh = timeline[start_i - 1]["kwh"]
 
     if anchor is None:
         # Pas d'ancre (premier passage) : depuis COST_START_DATE, en partant de 0
@@ -466,7 +541,8 @@ async def gazpar_import_all():
     """
     Service : pyscript.gazpar_import_all
     Import complet : daily + weekly + monthly + yearly, pour m³, kWh et coût.
-    À lancer une fois après une mise à jour du script ou une reprise d'historique.
+    ATTENTION : réécrit tout l'historique avec les seules données encore
+    fournies par gazpar2mqtt (14 jours de détail journalier en 0.3.x).
     """
     entity = hass.states.get(SOURCE_SENSOR)
     if entity is None:
@@ -501,7 +577,7 @@ async def gazpar_update():
     """
     Service : pyscript.gazpar_update
     Réimporte les UPDATE_DAYS derniers jours (m³, kWh et coût) jusqu'à la
-    dernière heure terminée.
+    dernière heure terminée, en repartant du cumul enregistré avant la fenêtre.
     Appelé automatiquement par l'automation dès que le capteur source change.
     """
     entity = hass.states.get(SOURCE_SENSOR)
